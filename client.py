@@ -169,74 +169,109 @@ if PHASE1_ONLY:
 else:
     print("NeuroSeek v0.2 — Connecting to Red Hat OpenShift Cluster...")
 
-last_triggered: dict[str, float] = {}   # state → timestamp of last LLM call
-latest_advice = ""                       # shown as OSD overlay on the webcam feed
-active_states: list[str] = []            # currently detected body-language states
-state_display_until = 0.0                # timestamp: how long to keep states on screen
+# ── Shared state between the main (display) thread and the API thread ──
+_lock = threading.Lock()
+_latest_jpg: bytes | None = None         # most recent compressed frame for the API
+_latest_kps: list | None = None          # most recent keypoints from the GPU
+_active_states: list[str] = []
+_state_display_until = 0.0
+_latest_advice = ""
+_last_triggered: dict[str, float] = {}
+
+
+def _api_worker():
+    """Background thread: grabs the latest JPEG, sends it to the GPU, updates shared state."""
+    global _latest_kps, _active_states, _state_display_until, _latest_advice
+
+    while cap.isOpened():
+        # Grab the most recent frame (skip stale ones automatically)
+        with _lock:
+            jpg = _latest_jpg
+        if jpg is None:
+            time.sleep(0.01)
+            continue
+
+        try:
+            resp = requests.post(API_URL, files={"file": jpg}, timeout=5)
+            data = resp.json()
+
+            if data['status'] == 'success':
+                kps = data['keypoints'][0]
+                nose_x, nose_y = kps[0]
+                print(f"Nose -> X: {nose_x:.2f} | Y: {nose_y:.2f}")
+
+                with _lock:
+                    _latest_kps = kps
+
+                # ── Phase 1: detect body-language states ──
+                states = analyze_body_language(kps)
+
+                if states:
+                    with _lock:
+                        _active_states = states
+                        _state_display_until = time.time() + 3.0
+
+                for state in states:
+                    now = time.time()
+                    if now - _last_triggered.get(state, 0) > STATE_COOLDOWN:
+                        _last_triggered[state] = now
+                        print(f"  [Body Language] {state}")
+
+                        if not PHASE1_ONLY:
+                            try:
+                                advice = get_social_advice(state)
+                                with _lock:
+                                    _latest_advice = advice
+                                print(f"  [Coach] {advice}")
+                                speak_async(advice)
+                            except Exception as llm_err:
+                                print(f"  [LLM Error] {llm_err}")
+            else:
+                print("No person detected.")
+                with _lock:
+                    _latest_kps = None
+
+        except Exception as e:
+            print(f"Network lag or server unavailable... {e}")
+
+        # Small sleep to avoid hammering the API faster than it can respond
+        time.sleep(0.03)
+
+
+# Start the API worker as a daemon thread
+threading.Thread(target=_api_worker, daemon=True).start()
 
 while True:
     ret, frame = cap.read()
     if not ret:
         break
 
-    # 1. Compress the frame so it survives the hackathon Wi-Fi
+    # 1. Compress the frame and hand it to the API thread (non-blocking)
     small = cv2.resize(frame, (640, 480))
     _, jpg = cv2.imencode('.jpg', small, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+    with _lock:
+        _latest_jpg = jpg.tobytes()
 
-    try:
-        # 2. Fire the frame through the tunnel to your GPU
-        resp = requests.post(API_URL, files={"file": jpg.tobytes()})
-        data = resp.json()
+    # 2. Draw the most recent keypoints we have (even if a few frames old)
+    with _lock:
+        kps = _latest_kps
+        states = list(_active_states)
+        show_states_until = _state_display_until
+        advice = _latest_advice
 
-        if data['status'] == 'success':
-            kps = data['keypoints'][0]
-            nose_x, nose_y = kps[0]
-            print(f"Nose -> X: {nose_x:.2f} | Y: {nose_y:.2f}")
+    if kps is not None:
+        draw_keypoints(frame, kps)
 
-            # ── Draw keypoints + skeleton on the live feed ──
-            draw_keypoints(frame, kps)
-
-            # ── Phase 1: detect body-language states ──
-            states = analyze_body_language(kps)
-
-            if states:
-                active_states = states
-                state_display_until = time.time() + 3.0   # show for 3 seconds
-
-            for state in states:
-                now = time.time()
-                if now - last_triggered.get(state, 0) > STATE_COOLDOWN:
-                    last_triggered[state] = now
-                    print(f"  [Body Language] {state}")
-
-                    if not PHASE1_ONLY:
-                        # ── Phase 2: ask Claude for advice ──
-                        try:
-                            advice = get_social_advice(state)
-                            latest_advice = advice
-                            print(f"  [Coach] {advice}")
-
-                            # ── Phase 3: speak it aloud ──
-                            speak_async(advice)
-                        except Exception as llm_err:
-                            print(f"  [LLM Error] {llm_err}")
-        else:
-            print("No person detected.")
-
-    except Exception as e:
-        print(f"Network lag or server unavailable... {e}")
-
-    # OSD: overlay detected body-language states on the video feed
-    if time.time() < state_display_until and active_states:
-        for i, st in enumerate(active_states):
+    # OSD: overlay detected body-language states
+    if time.time() < show_states_until and states:
+        for i, st in enumerate(states):
             y_pos = 30 + i * 30
             cv2.putText(frame, f">> {st}", (10, y_pos),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-    # OSD: overlay the latest coach advice on the webcam feed
-    if latest_advice and not PHASE1_ONLY:
-        display_text = latest_advice[:90]
-        cv2.putText(frame, display_text, (10, frame.shape[0] - 20),
+    # OSD: overlay the latest coach advice
+    if advice and not PHASE1_ONLY:
+        cv2.putText(frame, advice[:90], (10, frame.shape[0] - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
     cv2.imshow('NeuroSeek Client Feed', frame)
