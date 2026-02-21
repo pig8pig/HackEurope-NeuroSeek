@@ -5,8 +5,8 @@ from ultralytics import YOLO
 
 app = FastAPI()
 
-# This automatically downloads the YOLOv8-pose weights and loads them onto the A10G
-model = YOLO('yolov8n-pose.pt') 
+# This automatically downloads the YOLOv11-pose weights and loads them onto the A10G
+model = YOLO('yolo11n-pose.pt') 
 
 @app.post("/analyze-pose")
 async def analyze_pose(file: UploadFile = File(...)):

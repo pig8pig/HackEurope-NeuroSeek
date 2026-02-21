@@ -11,12 +11,14 @@ from elevenlabs import play
 
 # ━━━━━━━━━━━━━━━━━━━━━━ CONFIG ━━━━━━━━━━━━━━━━━━━━━━
 
-# Set to True to test ONLY Phase 1 (vision + body-language overlay).
-# No API keys needed — skips Claude and ElevenLabs entirely.
-PHASE1_ONLY = True
+# Which phases to run:
+#   1 = Phase 1 only (vision + body-language overlay, no API keys needed)
+#   2 = Phase 1 + 2 (adds Claude LLM advice, needs ANTHROPIC_API_KEY)
+#   3 = All phases  (adds ElevenLabs TTS audio, needs ELEVEN_API_KEY too)
+PHASE = 2
 
 # Your live Cloudflare URL pointing to the A10G
-API_URL = "https://modified-reaching-edwards-sheer.trycloudflare.com/analyze-pose"
+API_URL = "https://wars-emerald-ratio-jvc.trycloudflare.com/analyze-pose"
 
 # Thresholds (normalised 0-1 coords — tune for your camera distance)
 CROSSED_ARMS_DIST   = 0.05   # max wrist-to-wrist distance to count as "crossed"
@@ -61,7 +63,7 @@ def analyze_body_language(keypoints):
 
 # ━━━━━━━━━━━━━ PHASE 2 · LLM SOCIAL CO-PILOT ━━━━━━━━━━━━━
 
-claude_client = None if PHASE1_ONLY else anthropic.Anthropic()
+claude_client = anthropic.Anthropic() if PHASE >= 2 else None
 
 SYSTEM_PROMPT = (
     "You are a real-time social coach for a neurodivergent user who is in a live "
@@ -89,7 +91,7 @@ def get_social_advice(state: str) -> str:
 
 # ━━━━━━━━━━━━━ PHASE 3 · AUDIO OUTPUT ━━━━━━━━━━━━━
 
-eleven_client = None if PHASE1_ONLY else ElevenLabs()
+eleven_client = ElevenLabs() if PHASE >= 3 else None
 
 
 def _speak(text: str):
@@ -164,10 +166,7 @@ def draw_keypoints(frame, keypoints_norm):
 # ━━━━━━━━━━━━━━━━━━━━━━ MAIN LOOP ━━━━━━━━━━━━━━━━━━━━━━
 
 cap = cv2.VideoCapture(0)
-if PHASE1_ONLY:
-    print("NeuroSeek v0.2 [PHASE 1 TEST MODE] — Connecting to Red Hat OpenShift Cluster...")
-else:
-    print("NeuroSeek v0.2 — Connecting to Red Hat OpenShift Cluster...")
+print(f"NeuroSeek v0.2 [PHASE {PHASE} of 3] — Connecting to Red Hat OpenShift Cluster...")
 
 # ── Shared state between the main (display) thread and the API thread ──
 _lock = threading.Lock()
@@ -193,18 +192,27 @@ def _api_worker():
 
         try:
             resp = requests.post(API_URL, files={"file": jpg}, timeout=5)
+            if resp.status_code != 200:
+                print(f"  [Debug] Server returned HTTP {resp.status_code}: {resp.text[:200]}")
+                time.sleep(1)
+                continue
             data = resp.json()
 
             if data['status'] == 'success':
                 kps = data['keypoints'][0]
                 nose_x, nose_y = kps[0]
-                print(f"Nose -> X: {nose_x:.2f} | Y: {nose_y:.2f}")
 
                 with _lock:
                     _latest_kps = kps
 
                 # ── Phase 1: detect body-language states ──
                 states = analyze_body_language(kps)
+
+                # Live terminal readout every frame
+                if states:
+                    print(f"  [State] {' | '.join(states)}")
+                else:
+                    print(f"  [State] Neutral — no body language signals detected")
 
                 if states:
                     with _lock:
@@ -217,13 +225,14 @@ def _api_worker():
                         _last_triggered[state] = now
                         print(f"  [Body Language] {state}")
 
-                        if not PHASE1_ONLY:
+                        if PHASE >= 2:
                             try:
                                 advice = get_social_advice(state)
                                 with _lock:
                                     _latest_advice = advice
                                 print(f"  [Coach] {advice}")
-                                speak_async(advice)
+                                if PHASE >= 3:
+                                    speak_async(advice)
                             except Exception as llm_err:
                                 print(f"  [LLM Error] {llm_err}")
             else:
@@ -270,7 +279,7 @@ while True:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
     # OSD: overlay the latest coach advice
-    if advice and not PHASE1_ONLY:
+    if advice and PHASE >= 2:
         cv2.putText(frame, advice[:90], (10, frame.shape[0] - 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
