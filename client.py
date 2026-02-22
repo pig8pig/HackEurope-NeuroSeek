@@ -21,8 +21,16 @@ PHASE = 2
 API_URL = "https://wars-emerald-ratio-jvc.trycloudflare.com/analyze-pose"
 
 # Thresholds (normalised 0-1 coords — tune for your camera distance)
-CROSSED_ARMS_DIST   = 0.05   # max wrist-to-wrist distance to count as "crossed"
-DISENGAGE_THRESHOLD = 0.08   # min nose-above-shoulder gap; below this → "looking down"
+CROSSED_ARMS_DIST      = 0.12    # max wrist-to-wrist distance for "crossed" (relaxed — torso check gates it)
+OPEN_ARMS_DIST         = 0.35    # min wrist-to-wrist distance for "open posture"
+HAND_TO_FACE_DIST      = 0.07    # max wrist-to-nose distance for "touching face"
+DISENGAGE_THRESHOLD    = 0.08    # min nose-above-shoulder gap; below this → "looking down"
+FIDGET_THRESHOLD       = 0.06    # min frame-to-frame wrist movement to count as fidgeting
+HEAD_TILT_DEGREES      = 20.0    # min ear-to-ear angle for "head tilt"
+SHOULDER_RAISE_RATIO   = 0.25    # ear-shoulder gap / shoulder width — below = raised
+SHOULDER_ASYM_DEGREES  = 18.0    # min shoulder angle for "uneven shoulders"
+LEAN_FORWARD_RATIO     = 0.85    # shoulder-hip vertical ratio — below = leaning forward
+LEAN_LATERAL_RATIO     = 0.15    # shoulder-hip lateral offset ratio — above = leaning sideways
 
 # Cooldown so we don't spam the LLM for the same gesture (seconds)
 STATE_COOLDOWN = 10.0
@@ -35,21 +43,102 @@ def _valid(kp):
     return kp[0] > 0.0 or kp[1] > 0.0
 
 
+def _dist(a, b):
+    """Euclidean distance between two normalised keypoints."""
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _angle_deg(a, b):
+    """Tilt angle in degrees from horizontal. 0° = level.
+    Uses abs(dx) so L/R ordering of COCO keypoints doesn't matter.
+    Positive = b is lower than a, negative = b is higher."""
+    dx = abs(b[0] - a[0])
+    dy = b[1] - a[1]
+    if dx < 0.001:
+        return 0.0
+    return math.degrees(math.atan2(dy, dx))
+
+
+
+# Global state for fidget detection (rolling buffer of last 5 frame movements)
+_fidget_l_history = [0.0] * 5
+_fidget_r_history = [0.0] * 5
+_prev_l_wrist = None
+_prev_r_wrist = None
+
+
 def analyze_body_language(keypoints):
     """Take 17 COCO keypoints (normalised) for one person → list of state strings."""
+    global _prev_l_wrist, _prev_r_wrist
     states = []
 
     nose       = keypoints[0]
+    l_eye      = keypoints[1]
+    r_eye      = keypoints[2]
+    l_ear      = keypoints[3]
+    r_ear      = keypoints[4]
     l_shoulder = keypoints[5]
     r_shoulder = keypoints[6]
+    l_elbow    = keypoints[7]
+    r_elbow    = keypoints[8]
     l_wrist    = keypoints[9]
     r_wrist    = keypoints[10]
+    l_hip      = keypoints[11]
+    r_hip      = keypoints[12]
 
-    # ── Crossed Arms ──
-    if _valid(l_wrist) and _valid(r_wrist):
-        dist = _dist(l_wrist, r_wrist)
-        if dist < CROSSED_ARMS_DIST:
-            states.append("The person just crossed their arms.")
+    # ── Crossed Arms / Closed Position ──
+    # Robust detection that handles YOLO swapping L/R wrist labels.
+    # We treat both wrists as a pair ("wrist A" and "wrist B") without caring
+    # which one YOLO labelled as left or right.
+    if (_valid(l_wrist) and _valid(r_wrist) and
+            _valid(l_shoulder) and _valid(r_shoulder)):
+        wrist_a, wrist_b = l_wrist, r_wrist
+
+        # Shoulder bounding box (horizontal + vertical)
+        sh_left_x  = min(l_shoulder[0], r_shoulder[0])
+        sh_right_x = max(l_shoulder[0], r_shoulder[0])
+        sh_top_y   = min(l_shoulder[1], r_shoulder[1])
+
+        # Hip midpoint Y (if available) — otherwise estimate as shoulder + 0.25
+        if _valid(l_hip) and _valid(r_hip):
+            hip_mid_y = (l_hip[1] + r_hip[1]) / 2
+        else:
+            hip_mid_y = sh_top_y + 0.25
+
+        # 1) Both wrists must be between the shoulders horizontally
+        #    (i.e., in front of the torso, not behind the back or to the sides)
+        margin = 0.05  # small margin outside shoulder line
+        a_in_torso_x = (sh_left_x - margin) < wrist_a[0] < (sh_right_x + margin)
+        b_in_torso_x = (sh_left_x - margin) < wrist_b[0] < (sh_right_x + margin)
+
+        # 2) Both wrists must be in the upper 2/3 of the torso (not low at the waist)
+        #    That is: wrist_y < (hip_mid_y - (torso_len * 1/3))
+        torso_len = hip_mid_y - sh_top_y
+        min_y = sh_top_y - 0.03
+        max_y = hip_mid_y - (torso_len * (1/3))
+        a_at_chest = min_y < wrist_a[1] < max_y
+        b_at_chest = min_y < wrist_b[1] < max_y
+
+        in_front_and_chest = a_in_torso_x and b_in_torso_x and a_at_chest and b_at_chest
+
+        if in_front_and_chest:
+            wrist_dist = _dist(wrist_a, wrist_b)
+
+            # Check A: wrists are close together at chest level
+            close_together = wrist_dist < CROSSED_ARMS_DIST
+
+            # Check B: wrists have crossed over each other (left wrist on
+            # the right side and vice versa). YOLO may swap the labels, so
+            # we also check relative to the elbows if available.
+            crossover = False
+            if _valid(l_elbow) and _valid(r_elbow):
+                # If a wrist is on the opposite side of its own elbow, it crossed
+                l_crossed = (l_wrist[0] > l_elbow[0] + 0.03) if l_shoulder[0] < r_shoulder[0] else (l_wrist[0] < l_elbow[0] - 0.03)
+                r_crossed = (r_wrist[0] < r_elbow[0] - 0.03) if l_shoulder[0] < r_shoulder[0] else (r_wrist[0] > r_elbow[0] + 0.03)
+                crossover = l_crossed and r_crossed
+
+            if close_together or crossover:
+                states.append("The person just crossed their arms.")
 
     # ── Open / Expansive Posture ──
     if _valid(l_wrist) and _valid(r_wrist):
@@ -72,12 +161,20 @@ def analyze_body_language(keypoints):
         if r_wrist[1] < r_shoulder[1] - 0.05:
             states.append("The person has their right hand raised above their shoulder.")
 
-    # ── Fidgeting (rapid wrist movement between frames) ──
+    # ── Fidgeting (rapid wrist movement over several frames) ──
     if _valid(l_wrist) and _valid(r_wrist):
+        global _fidget_l_history, _fidget_r_history
         if _prev_l_wrist is not None and _prev_r_wrist is not None:
             l_move = _dist(l_wrist, _prev_l_wrist)
             r_move = _dist(r_wrist, _prev_r_wrist)
-            if l_move > FIDGET_THRESHOLD or r_move > FIDGET_THRESHOLD:
+            # Update rolling history (last 5 frames)
+            _fidget_l_history = _fidget_l_history[1:] + [l_move]
+            _fidget_r_history = _fidget_r_history[1:] + [r_move]
+            # Count how many of the last 5 frames had big movement
+            l_fidget_count = sum(1 for m in _fidget_l_history if m > FIDGET_THRESHOLD)
+            r_fidget_count = sum(1 for m in _fidget_r_history if m > FIDGET_THRESHOLD)
+            # Only trigger if 3+ out of 5 frames had big movement for either hand
+            if l_fidget_count >= 3 or r_fidget_count >= 3:
                 states.append("The person appears to be fidgeting with their hands.")
         _prev_l_wrist = l_wrist
         _prev_r_wrist = r_wrist
@@ -94,17 +191,19 @@ def analyze_body_language(keypoints):
             states.append("The person is looking down and seems disengaged.")
 
     # ── Head Tilted (curiosity, confusion, or interest) ──
+    # Neutral zone: -HEAD_TILT_DEGREES to +HEAD_TILT_DEGREES is considered straight
     if _valid(l_ear) and _valid(r_ear):
         tilt = _angle_deg(l_ear, r_ear)
         if tilt > HEAD_TILT_DEGREES:
             states.append("The person is tilting their head to the right — possibly curious or confused.")
         elif tilt < -HEAD_TILT_DEGREES:
             states.append("The person is tilting their head to the left — possibly curious or confused.")
+        # else: within ±HEAD_TILT_DEGREES → neutral, no state
 
     # ── Nodding (nose drops below eye midpoint) ──
     if _valid(nose) and _valid(l_eye) and _valid(r_eye):
         eye_mid_y = (l_eye[1] + r_eye[1]) / 2
-        if nose[1] - eye_mid_y > 0.04:
+        if nose[1] - eye_mid_y > 0.06:
             states.append("The person appears to be nodding — a sign of agreement.")
 
     # ── Looking Away / No Eye Contact (face turned sideways) ──
@@ -133,34 +232,12 @@ def analyze_body_language(keypoints):
                 states.append("The person's shoulders are raised — they may be tense or stressed.")
 
     # ── Asymmetric Shoulders (discomfort, shrug) ──
+    # Neutral zone: -SHOULDER_ASYM_DEGREES to +SHOULDER_ASYM_DEGREES is considered even
     if _valid(l_shoulder) and _valid(r_shoulder):
         angle = _angle_deg(l_shoulder, r_shoulder)
         if abs(angle) > SHOULDER_ASYM_DEGREES:
             states.append("The person has uneven shoulders — possibly shrugging or uncomfortable.")
-
-    # ── Leaning Forward (engaged, interested) ──
-    if (_valid(l_shoulder) and _valid(r_shoulder) and
-            _valid(l_hip) and _valid(r_hip)):
-        sh_mid_y = (l_shoulder[1] + r_shoulder[1]) / 2
-        hip_mid_y = (l_hip[1] + r_hip[1]) / 2
-        torso_len = abs(hip_mid_y - sh_mid_y)
-        if torso_len > 0.01:
-            vertical = (sh_mid_y - hip_mid_y) / torso_len
-            if vertical < LEAN_FORWARD_RATIO:
-                states.append("The person is leaning forward — they seem engaged and interested.")
-
-    # ── Leaning Sideways (bored, shifting away) ──
-    if (_valid(l_shoulder) and _valid(r_shoulder) and
-            _valid(l_hip) and _valid(r_hip)):
-        sh_mid_x  = (l_shoulder[0] + r_shoulder[0]) / 2
-        hip_mid_x = (l_hip[0] + r_hip[0]) / 2
-        torso_len = abs((l_hip[1] + r_hip[1]) / 2 - (l_shoulder[1] + r_shoulder[1]) / 2)
-        if torso_len > 0.01:
-            lateral = (sh_mid_x - hip_mid_x) / torso_len
-            if lateral > LEAN_LATERAL_RATIO:
-                states.append("The person is leaning to their right — they may be shifting away.")
-            elif lateral < -LEAN_LATERAL_RATIO:
-                states.append("The person is leaning to their left — they may be shifting away.")
+        # else: within ±SHOULDER_ASYM_DEGREES → neutral, no state
 
     # ── Turned Away (shoulders rotated away from camera) ──
     if _valid(l_shoulder) and _valid(r_shoulder):
@@ -241,7 +318,7 @@ SKELETON = [
 ]
 
 # Highlight the nodes we actively use for body-language detection
-ACTIVE_NODES = {0, 5, 6, 9, 10}
+ACTIVE_NODES = {0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12}
 
 
 def draw_keypoints(frame, keypoints_norm):
@@ -328,6 +405,10 @@ def _api_worker():
                     with _lock:
                         _active_states = states
                         _state_display_until = time.time() + 3.0
+                else:
+                    with _lock:
+                        _active_states = []
+                        _state_display_until = 0.0
 
                 for state in states:
                     now = time.time()
