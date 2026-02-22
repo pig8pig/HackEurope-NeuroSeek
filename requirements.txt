@@ -6,4 +6,4 @@ numpy
 sounddevice
 soundfile
 python-dotenv
-pygame
+pygame-ce
