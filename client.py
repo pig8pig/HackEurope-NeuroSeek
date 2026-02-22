@@ -45,18 +45,128 @@ def analyze_body_language(keypoints):
     l_wrist    = keypoints[9]
     r_wrist    = keypoints[10]
 
-    # ── State 1: Crossed Arms ──
+    # ── Crossed Arms ──
     if _valid(l_wrist) and _valid(r_wrist):
-        dist = math.hypot(l_wrist[0] - r_wrist[0], l_wrist[1] - r_wrist[1])
+        dist = _dist(l_wrist, r_wrist)
         if dist < CROSSED_ARMS_DIST:
             states.append("The person just crossed their arms.")
 
-    # ── State 2: Disengaged (looking down) ──
+    # ── Open / Expansive Posture ──
+    if _valid(l_wrist) and _valid(r_wrist):
+        dist = _dist(l_wrist, r_wrist)
+        if dist > OPEN_ARMS_DIST:
+            states.append("The person has an open, expansive posture — arms spread wide.")
+
+    # ── Hand Touching Face (thinking, anxious, or deceptive cue) ──
+    if _valid(nose):
+        if _valid(l_wrist) and _dist(l_wrist, nose) < HAND_TO_FACE_DIST:
+            states.append("The person is touching their face with their left hand.")
+        if _valid(r_wrist) and _dist(r_wrist, nose) < HAND_TO_FACE_DIST:
+            states.append("The person is touching their face with their right hand.")
+
+    # ── Hand Raised Above Shoulder (wants to speak / waving) ──
+    if _valid(l_wrist) and _valid(l_shoulder):
+        if l_wrist[1] < l_shoulder[1] - 0.05:
+            states.append("The person has their left hand raised above their shoulder.")
+    if _valid(r_wrist) and _valid(r_shoulder):
+        if r_wrist[1] < r_shoulder[1] - 0.05:
+            states.append("The person has their right hand raised above their shoulder.")
+
+    # ── Fidgeting (rapid wrist movement between frames) ──
+    if _valid(l_wrist) and _valid(r_wrist):
+        if _prev_l_wrist is not None and _prev_r_wrist is not None:
+            l_move = _dist(l_wrist, _prev_l_wrist)
+            r_move = _dist(r_wrist, _prev_r_wrist)
+            if l_move > FIDGET_THRESHOLD or r_move > FIDGET_THRESHOLD:
+                states.append("The person appears to be fidgeting with their hands.")
+        _prev_l_wrist = l_wrist
+        _prev_r_wrist = r_wrist
+
+    # ═══════════════════════════════════════════════════════════
+    # HEAD STATES
+    # ═══════════════════════════════════════════════════════════
+
+    # ── Disengaged / Looking Down ──
     if _valid(nose) and _valid(l_shoulder) and _valid(r_shoulder):
         avg_shoulder_y = (l_shoulder[1] + r_shoulder[1]) / 2
-        gap = avg_shoulder_y - nose[1]          # positive when nose is above shoulders
+        gap = avg_shoulder_y - nose[1]
         if gap < DISENGAGE_THRESHOLD:
             states.append("The person is looking down and seems disengaged.")
+
+    # ── Head Tilted (curiosity, confusion, or interest) ──
+    if _valid(l_ear) and _valid(r_ear):
+        tilt = _angle_deg(l_ear, r_ear)
+        if tilt > HEAD_TILT_DEGREES:
+            states.append("The person is tilting their head to the right — possibly curious or confused.")
+        elif tilt < -HEAD_TILT_DEGREES:
+            states.append("The person is tilting their head to the left — possibly curious or confused.")
+
+    # ── Nodding (nose drops below eye midpoint) ──
+    if _valid(nose) and _valid(l_eye) and _valid(r_eye):
+        eye_mid_y = (l_eye[1] + r_eye[1]) / 2
+        if nose[1] - eye_mid_y > 0.04:
+            states.append("The person appears to be nodding — a sign of agreement.")
+
+    # ── Looking Away / No Eye Contact (face turned sideways) ──
+    if _valid(l_ear) and _valid(r_ear) and _valid(nose):
+        # If one ear is much closer to the nose than the other, face is turned
+        l_ear_to_nose = abs(l_ear[0] - nose[0])
+        r_ear_to_nose = abs(r_ear[0] - nose[0])
+        if l_ear_to_nose > 0.01 and r_ear_to_nose > 0.01:
+            ratio = min(l_ear_to_nose, r_ear_to_nose) / max(l_ear_to_nose, r_ear_to_nose)
+            if ratio < 0.4:
+                states.append("The person is looking away — they may have lost interest or are thinking.")
+
+    # ═══════════════════════════════════════════════════════════
+    # SHOULDER / TORSO STATES
+    # ═══════════════════════════════════════════════════════════
+
+    # ── Shoulders Raised (tension, stress, nervousness) ──
+    if _valid(l_shoulder) and _valid(r_shoulder) and _valid(l_ear) and _valid(r_ear):
+        shoulder_width = abs(l_shoulder[0] - r_shoulder[0])
+        if shoulder_width > 0.01:
+            l_gap = abs(l_shoulder[1] - l_ear[1])
+            r_gap = abs(r_shoulder[1] - r_ear[1])
+            avg_gap = (l_gap + r_gap) / 2
+            ratio = avg_gap / shoulder_width
+            if ratio < SHOULDER_RAISE_RATIO:
+                states.append("The person's shoulders are raised — they may be tense or stressed.")
+
+    # ── Asymmetric Shoulders (discomfort, shrug) ──
+    if _valid(l_shoulder) and _valid(r_shoulder):
+        angle = _angle_deg(l_shoulder, r_shoulder)
+        if abs(angle) > SHOULDER_ASYM_DEGREES:
+            states.append("The person has uneven shoulders — possibly shrugging or uncomfortable.")
+
+    # ── Leaning Forward (engaged, interested) ──
+    if (_valid(l_shoulder) and _valid(r_shoulder) and
+            _valid(l_hip) and _valid(r_hip)):
+        sh_mid_y = (l_shoulder[1] + r_shoulder[1]) / 2
+        hip_mid_y = (l_hip[1] + r_hip[1]) / 2
+        torso_len = abs(hip_mid_y - sh_mid_y)
+        if torso_len > 0.01:
+            vertical = (sh_mid_y - hip_mid_y) / torso_len
+            if vertical < LEAN_FORWARD_RATIO:
+                states.append("The person is leaning forward — they seem engaged and interested.")
+
+    # ── Leaning Sideways (bored, shifting away) ──
+    if (_valid(l_shoulder) and _valid(r_shoulder) and
+            _valid(l_hip) and _valid(r_hip)):
+        sh_mid_x  = (l_shoulder[0] + r_shoulder[0]) / 2
+        hip_mid_x = (l_hip[0] + r_hip[0]) / 2
+        torso_len = abs((l_hip[1] + r_hip[1]) / 2 - (l_shoulder[1] + r_shoulder[1]) / 2)
+        if torso_len > 0.01:
+            lateral = (sh_mid_x - hip_mid_x) / torso_len
+            if lateral > LEAN_LATERAL_RATIO:
+                states.append("The person is leaning to their right — they may be shifting away.")
+            elif lateral < -LEAN_LATERAL_RATIO:
+                states.append("The person is leaning to their left — they may be shifting away.")
+
+    # ── Turned Away (shoulders rotated away from camera) ──
+    if _valid(l_shoulder) and _valid(r_shoulder):
+        shoulder_width = abs(l_shoulder[0] - r_shoulder[0])
+        if shoulder_width < 0.08:
+            states.append("The person has turned their body away from you.")
 
     return states
 
