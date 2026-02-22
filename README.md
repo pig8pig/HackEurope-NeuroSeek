@@ -2,7 +2,7 @@
 
 > **Hack Europe 2026** — An enterprise-grade, real-time multi-modal social co-pilot for neurodivergent individuals.
 
-NeuroCue combines **computer vision** (YOLOv11 pose estimation) with **live speech transcription** (ElevenLabs Scribe) to read body language *and* listen to what's being said. Every 15 seconds, it feeds both modalities into **Claude** and whispers real-time social advice into your ear via **ElevenLabs TTS** — all in near-real-time.
+NeuroCue combines **computer vision** (YOLOv11 pose estimation), a custom **Facial Expression Recognition** CNN (FERNet with Squeeze-Excite residual blocks), and **live speech transcription** (ElevenLabs Scribe) to read body language, detect facial emotions, *and* listen to what's being said. Every 15 seconds, it feeds all three modalities into **Claude** and whispers real-time social advice into your ear via **ElevenLabs TTS** — all in near-real-time.
 
 ---
 
@@ -10,6 +10,7 @@ NeuroCue combines **computer vision** (YOLOv11 pose estimation) with **live spee
 
 ```
 Webcam ─► GPU Pose Estimation ─► Body Language Geometry ─┐
+Webcam ─► FERNet (local CNN) ─► Facial Expression ───────┤
                                                           ├─► Claude LLM ─► ElevenLabs TTS ─► Your Ear
 Microphone ─► ElevenLabs Speech-to-Text ─────────────────┘
 ```
@@ -17,10 +18,11 @@ Microphone ─► ElevenLabs Speech-to-Text ────────────
 | Layer | What it does | Where it runs |
 |-------|-------------|---------------|
 | **Vision Engine** | YOLOv11 Nano Pose → 17 COCO keypoints | Red Hat OpenShift (NVIDIA A10G) |
+| **FER Engine** | Custom CNN (FERNet + SE blocks) → 7 emotions | Local laptop (CPU/GPU) |
 | **Network** | Cloudflare Quick Tunnel | Cloud |
 | **Spatial Translator** | Geometry on keypoints → body-language states | Local laptop |
 | **Speech-to-Text** | ElevenLabs Scribe v1 → transcript of last 15 s | ElevenLabs API |
-| **Social Co-Pilot** | Claude synthesises vision + transcript → coaching advice | Anthropic API |
+| **Social Co-Pilot** | Claude synthesises body language + facial expression + transcript → advice | Anthropic API |
 | **Audio Output** | ElevenLabs TTS plays advice through speakers | Local laptop |
 
 ## Architecture
@@ -47,10 +49,13 @@ Microphone ─► ElevenLabs Speech-to-Text ────────────
 │  │  → WAV → 11Labs  │    │  ──► Claude API ──► advice      │  │
 │  │    Scribe STT    │    │  ──► ElevenLabs TTS ──► 🔊      │  │
 │  └─────────────────┘    └─────────────────────────────────┘  │
-│                                                              │
-│  ┌─────────────────┐                                         │
-│  │  Main Thread     │  OpenCV display + keypoint overlay     │
-│  │  (UI loop)       │  + on-screen advice text               │
+│                                            ▲                 │
+│  ┌─────────────────┐                       │                 │
+│  │  Main Thread     │  OpenCV display +    │                 │
+│  │  (UI loop)       │  keypoint overlay +  │                 │
+│  │                  │  on-screen advice     │                 │
+│  │  FER every 5s    │── _fer_state_history ─┘                │
+│  │  (Haar + FERNet) │  + face bbox overlay                   │
 │  └─────────────────┘                                         │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -59,9 +64,9 @@ Microphone ─► ElevenLabs Speech-to-Text ────────────
 
 | Thread | Role | Writes to | Reads from |
 |--------|------|-----------|------------|
-| **Main (UI)** | Webcam capture, keypoint overlay, OSD text | `_latest_jpg` | `_latest_kps`, `_active_states`, `_latest_advice` |
+| **Main (UI)** | Webcam capture, keypoint overlay, FER every 5s, OSD text | `_latest_jpg`, `_latest_fer_result`, `_fer_state_history` | `_latest_kps`, `_active_states`, `_latest_advice` |
 | **Vision (`_api_worker`)** | Sends frames to GPU, runs body-language geometry | `_latest_kps`, `_active_states` | `_latest_jpg` |
-| **Audio + LLM (`_audio_and_llm_worker`)** | Records mic → STT → calls Claude → TTS | `_latest_advice` | `_active_states` |
+| **Audio + LLM (`_audio_and_llm_worker`)** | Records mic → STT → drains FER history → calls Claude → TTS | `_latest_advice` | `_active_states`, `_fer_state_history` |
 
 All shared state is protected by a single `threading.Lock`.
 
@@ -81,6 +86,27 @@ All shared state is protected by a single `threading.Lock`.
 | **Shoulders Raised** | Ear-shoulder gap / shoulder width too small | 3, 4, 5, 6 |
 | **Uneven Shoulders** | Shoulder angle > threshold | 5, 6 |
 | **Turned Away** | Shoulder width < threshold | 5, 6 |
+
+## Facial Expression Recognition (FER)
+
+A custom-trained **FERNet** CNN runs locally on the webcam frame every **5 seconds** (3 readings per 15-second Claude cycle). All readings are accumulated into a deduplicated history list and sent together — so Claude sees the **emotional progression** over the window (e.g., `"happy → anxious → masking discomfort"`).
+
+1. **Face detection** — OpenCV Haar Cascade (ships with OpenCV, no download)
+2. **Crop & preprocess** — largest face → 96×96 grayscale, normalised
+3. **Inference** — ResNet-style blocks with Squeeze-Excite attention → 7-class softmax
+4. **Smart state mapping** — compound expressions detected from probability distributions:
+
+| FER Output | State String |
+|------------|-------------|
+| happy (high conf) | "The person is smiling — they appear happy and engaged." |
+| happy (low conf + high neutral) | "The person is giving a polite smile — they may not be genuinely engaged." |
+| happy + fear/sad undertones | "The person is smiling but may be masking discomfort." |
+| surprise + fear | "The person looks confused — consider explaining more clearly." |
+| angry | "The person's face shows anger or frustration." |
+| sad | "The person looks sad or dejected." |
+| fear | "The person looks anxious or fearful — they may be uncomfortable." |
+
+> **Graceful degradation:** If `fer_model_best.pt` is missing, empty (0 bytes), or fails to load (e.g., still training), the app prints a warning and continues with body language + transcription only. No crash.
 
 ## Quick Start
 
@@ -150,10 +176,13 @@ Tunable constants at the top of `client.py`:
 | `CLAUDE_COOLDOWN` | `15.0` | Seconds between Claude API calls (= audio window) |
 | `SR` | `16000` | Microphone sampling rate (Hz) |
 | `WINDOW_SECONDS` | `15` | Audio window for STT transcription |
+| `FER_MODEL_PATH` | `fer_model_best.pt` | Path to trained FERNet weights (auto-disabled if empty/missing) |
+| `FER_INTERVAL` | `5.0` | Seconds between FER analyses (3 per Claude cycle) |
 
 ## Tech Stack
 
-- **Computer Vision:** YOLOv11 Nano Pose (Ultralytics)
+- **Pose Estimation:** YOLOv11 Nano Pose (Ultralytics)
+- **Facial Expression Recognition:** Custom FERNet CNN (ResBlocks + Squeeze-Excite + Haar Cascade), PyTorch
 - **GPU Compute:** NVIDIA A10G on Red Hat OpenShift AI
 - **Backend API:** FastAPI + Uvicorn
 - **Tunnel:** Cloudflare Quick Tunnel
@@ -161,7 +190,7 @@ Tunable constants at the top of `client.py`:
 - **LLM:** Anthropic Claude 3 Haiku
 - **TTS:** ElevenLabs Turbo v2.5
 - **Audio Capture:** sounddevice + soundfile
-- **Client:** Python, OpenCV, Pygame, NumPy
+- **Client:** Python, OpenCV, Pygame, NumPy, PyTorch
 
 ## Team
 

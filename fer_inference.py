@@ -115,7 +115,7 @@ class FERInference:
 
     def analyze(self, frame: np.ndarray) -> dict | None:
         """
-        Analyze a BGR frame for facial expression.
+        Analyze a BGR frame for facial expression using Haar Cascade.
 
         Args:
             frame: BGR numpy array from cv2.VideoCapture
@@ -147,6 +147,68 @@ class FERInference:
         if face_gray.size == 0:
             return None
 
+        return self._classify_face(face_gray, x, y, w, h)
+
+    def analyze_from_keypoints(self, frame: np.ndarray, keypoints_norm: list) -> dict | None:
+        """
+        Analyze facial expression using YOLO pose keypoints to crop the face.
+
+        Uses nose (0), L eye (1), R eye (2), L ear (3), R ear (4) to compute
+        a square bounding box, crops from the BGR frame, converts to grayscale,
+        and runs through FERNet.
+
+        Args:
+            frame: BGR numpy array from cv2.VideoCapture
+            keypoints_norm: list of 17 [x, y] normalised (0-1) COCO keypoints
+
+        Returns:
+            dict with emotion, confidence, all_probs, box
+            None if not enough face keypoints are visible
+        """
+        h_frame, w_frame = frame.shape[:2]
+
+        # Gather valid face keypoints (indices 0-4: nose, L eye, R eye, L ear, R ear)
+        face_kp_indices = [0, 1, 2, 3, 4]
+        valid_pts = []
+        for i in face_kp_indices:
+            kp = keypoints_norm[i]
+            if kp[0] > 0.0 or kp[1] > 0.0:  # not [0, 0]
+                valid_pts.append((kp[0] * w_frame, kp[1] * h_frame))
+
+        # Need at least 2 face keypoints to form a reasonable box
+        if len(valid_pts) < 2:
+            return None
+
+        # Compute bounding box around valid face keypoints
+        xs = [p[0] for p in valid_pts]
+        ys = [p[1] for p in valid_pts]
+        cx = (min(xs) + max(xs)) / 2
+        cy = (min(ys) + max(ys)) / 2
+
+        # Square side = max span with generous margin (1.8x for forehead/chin)
+        span = max(max(xs) - min(xs), max(ys) - min(ys))
+        side = max(int(span * 1.8), 60)  # at least 60px
+        half = side // 2
+
+        # Square crop coordinates (clamped to frame)
+        x1 = max(0, int(cx - half))
+        y1 = max(0, int(cy - half))
+        x2 = min(w_frame, int(cx + half))
+        y2 = min(h_frame, int(cy + half))
+
+        # Convert to grayscale and crop
+        gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        face_gray = gray_full[y1:y2, x1:x2]
+        if face_gray.size == 0:
+            return None
+
+        box_x, box_y = x1, y1
+        box_w, box_h = x2 - x1, y2 - y1
+
+        return self._classify_face(face_gray, box_x, box_y, box_w, box_h)
+
+    def _classify_face(self, face_gray: np.ndarray, x: int, y: int, w: int, h: int) -> dict | None:
+        """Shared classification: resize grayscale face crop → FERNet → result dict."""
         # Preprocess: resize to 96×96, normalize
         face_resized = cv2.resize(face_gray, (self.img_size, self.img_size))
         face_float = face_resized.astype(np.float32) / 255.0

@@ -19,6 +19,7 @@ load_dotenv()
 
 import anthropic
 from elevenlabs.client import ElevenLabs
+from fer_inference import FERInference
 
 pygame.mixer.init()
 
@@ -48,6 +49,10 @@ LEAN_LATERAL_RATIO     = 0.15    # shoulder-hip lateral offset ratio — above =
 
 # Minimum gap between Claude API calls (seconds)
 CLAUDE_COOLDOWN = 15.0
+
+# ── Facial Expression Recognition Config ──
+FER_MODEL_PATH = "fer_model_best.pt"
+FER_INTERVAL = 5.0                # seconds between FER analyses (3 per Claude cycle)
 
 # ── Audio / STT Config ──
 SR = 16000                  # sampling rate for microphone capture
@@ -306,14 +311,31 @@ def analyze_body_language(keypoints):
 
 claude_client = anthropic.Anthropic() if PHASE >= 2 else None
 
+# ── Facial Expression Recognition (safe load) ──
+fer_engine = None
+if os.path.exists(FER_MODEL_PATH) and os.path.getsize(FER_MODEL_PATH) > 0:
+    try:
+        fer_engine = FERInference(FER_MODEL_PATH)
+        print("[FER] Facial expression recognition active.")
+    except Exception as e:
+        print(f"[FER] Model file exists but failed to load (likely still training/empty): {e}")
+else:
+    print(f"[FER] Model empty or not found at {FER_MODEL_PATH} — FER disabled for now.")
+
 SYSTEM_PROMPT = (
     "You are NeuroCue, a real-time multi-modal social cue interpreter and coach "
     "designed for neurodivergent individuals and employees in workplace settings.\n\n"
-    "Every 15 seconds you receive two streams of information about the person the "
-    "user is talking to:\n"
+    "You receive three types of signals: body language from pose estimation, facial "
+    "expressions from emotion recognition, and a transcript of what was said. "
+    "When body language and facial expression conflict (e.g. open posture but fearful "
+    "face), note the discrepancy — the mismatch itself is informative. Facial "
+    "expressions are harder to fake than body posture.\n\n"
+    "Every 15 seconds you receive:\n"
     "  • [Latest Body Language] — visual pose / gesture observations from a camera.\n"
+    "  • [Facial Expression] — emotion detected from face recognition (may be empty "
+    "if no face found or model not loaded).\n"
     "  • [Transcript] — what they actually said, transcribed from audio.\n\n"
-    "Synthesise BOTH streams into a single, coherent picture. "
+    "Synthesise ALL available streams into a single, coherent picture. "
     "Respond with EXACTLY two parts:\n"
     "1. **What's happening:** A single short sentence summarising what the other person "
     "is likely feeling or communicating socially.\n"
@@ -325,11 +347,13 @@ SYSTEM_PROMPT = (
 )
 
 
-def get_social_advice(body_states: list[str], transcript: str) -> str:
-    """Send multi-modal context (vision + transcript) to Claude → advice."""
+def get_social_advice(body_states: list[str], fer_state: str, transcript: str) -> str:
+    """Send multi-modal context (vision + FER + transcript) to Claude → advice."""
     body_text = " ".join(body_states) if body_states else "No body language signals detected."
+    fer_text = fer_state if fer_state else "No facial expression detected."
     user_content = (
         f"[Latest Body Language]: {body_text}\n"
+        f"[Facial Expression]: {fer_text}\n"
         f'[Transcript]: "{transcript}"\n\n'
         f"What's happening and what should I do?"
     )
@@ -441,6 +465,9 @@ _latest_kps: list | None = None          # most recent keypoints from the GPU
 _active_states: list[str] = []
 _state_display_until = 0.0
 _latest_advice = ""
+_latest_fer_result = None             # most recent FER analysis dict (for drawing)
+_fer_state_history: list[str] = []    # accumulates FER states between Claude calls
+_last_fer_time = 0.0                  # timestamp of last FER run
 
 
 def _api_worker():
@@ -551,18 +578,35 @@ def _audio_and_llm_worker():
                 print("  └─────────────────────────────────────────────────────┘")
                 print()
 
-                # ── 3. Snapshot the latest vision states ──
+                # ── 3. Snapshot the latest vision + drain FER history ──
                 with _lock:
                     current_body_states = list(_active_states)
+                    # Drain all FER states accumulated since the last Claude call
+                    fer_history = list(_fer_state_history)
+                    _fer_state_history.clear()
+
+                # Deduplicate while preserving order (shows emotional progression)
+                seen = set()
+                unique_fer = []
+                for s in fer_history:
+                    if s not in seen:
+                        seen.add(s)
+                        unique_fer.append(s)
+                current_fer_state = " → ".join(unique_fer) if unique_fer else ""
 
                 # ── 4. Call Claude (Phase 2+) ──
                 if PHASE >= 2 and claude_client is not None:
                     for s in current_body_states:
                         print(f"  [Body Language → Claude] {s}")
+                    if unique_fer:
+                        for i, fs in enumerate(unique_fer, 1):
+                            print(f"  [FER {i}/{len(unique_fer)} → Claude] {fs}")
+                    else:
+                        print("  [FER → Claude] (no expressions captured)")
                     print(f'  [Transcript → Claude] "{transcript}"')
                     try:
                         advice = get_social_advice(
-                            current_body_states, transcript
+                            current_body_states, current_fer_state, transcript
                         )
                         with _lock:
                             _latest_advice = advice
@@ -634,6 +678,50 @@ while True:
             y_pos = frame.shape[0] - 20 - i * 28
             cv2.putText(frame, line, (10, y_pos),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+
+    # ── FER: run facial expression recognition every FER_INTERVAL seconds ──
+    if fer_engine is not None:
+        now = time.time()
+        if now - _last_fer_time >= FER_INTERVAL:
+            _last_fer_time = now
+            try:
+                # Use YOLO keypoints to crop face (much more reliable than Haar)
+                # Falls back to Haar cascade if no keypoints available
+                if kps is not None:
+                    fer_result = fer_engine.analyze_from_keypoints(frame, kps)
+                else:
+                    fer_result = fer_engine.analyze(frame)
+                fer_state = fer_engine.get_state_string(fer_result) if fer_result else ""
+                with _lock:
+                    _latest_fer_result = fer_result
+                    if fer_state:
+                        _fer_state_history.append(fer_state)
+                if fer_result:
+                    emo = fer_result['emotion']
+                    conf = fer_result['confidence']
+                    probs = fer_result['all_probs']
+                    print()
+                    print("  ┌─────────────────── FER ───────────────────────┐")
+                    print(f"  │  Detected: {emo.upper()} ({conf:.0%})")
+                    for e, p in sorted(probs.items(), key=lambda kv: kv[1], reverse=True):
+                        bar = "█" * int(p * 30)
+                        marker = " ◀" if e == emo else ""
+                        print(f"  │    {e:10s}  {p:.3f}  {bar}{marker}")
+                    if fer_state:
+                        print(f"  │  → {fer_state}")
+                    else:
+                        print("  │  → (below confidence threshold)")
+                    print("  └─────────────────────────────────────────────────┘")
+                else:
+                    print("  [FER] No face detected.")
+            except Exception as fer_err:
+                print(f"  [FER Error] {fer_err}")
+
+    # Draw FER bounding box + label if we have a recent result
+    with _lock:
+        fer_draw = _latest_fer_result
+    if fer_engine is not None and fer_draw is not None:
+        fer_engine.draw_on_frame(frame, fer_draw)
 
     cv2.imshow('NeuroCue Client Feed', frame)
 
