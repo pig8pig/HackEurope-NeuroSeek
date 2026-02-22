@@ -1,5 +1,7 @@
 import io
 import os
+import sys
+import queue
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 import pygame
 import cv2
@@ -7,6 +9,10 @@ import requests
 import math
 import threading
 import time
+
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -42,6 +48,46 @@ LEAN_LATERAL_RATIO     = 0.15    # shoulder-hip lateral offset ratio — above =
 
 # Minimum gap between Claude API calls (seconds)
 CLAUDE_COOLDOWN = 15.0
+
+# ── Audio / STT Config ──
+SR = 16000                  # sampling rate for microphone capture
+CHANNELS = 1                # mono
+WINDOW_SECONDS = 15         # STT window (seconds)
+BLOCK_SECONDS = 0.5         # streaming block size (seconds) for sounddevice callback
+
+# Shared audio queue — sounddevice callback pushes blocks here
+_audio_queue: queue.Queue = queue.Queue()
+
+
+# ━━━━━━━━━━━━━ AUDIO HELPERS ━━━━━━━━━━━━━
+
+def int16_to_float32(x: np.ndarray) -> np.ndarray:
+    """Convert int16 audio to float32 in [-1, 1]."""
+    if x.dtype == np.int16:
+        return x.astype(np.float32) / 32768.0
+    return x.astype(np.float32)
+
+
+def _audio_callback(indata, frames, time_info, status):
+    """sounddevice callback: push incoming audio into the shared queue."""
+    if status:
+        print(f"  [Mic Status] {status}", file=sys.stderr)
+    _audio_queue.put(indata.copy())
+
+
+def _collect_audio_segment(duration_s: float) -> np.ndarray:
+    """Drain *duration_s* seconds of audio from _audio_queue → 1-D float32 array."""
+    needed = int(round(duration_s * SR))
+    collected = np.zeros((0, CHANNELS), dtype=np.float32)
+    while collected.shape[0] < needed:
+        try:
+            block = _audio_queue.get(timeout=5.0)
+        except queue.Empty:
+            raise RuntimeError("No audio received from microphone (timeout).")
+        block = int16_to_float32(block) if block.dtype.kind == "i" else block.astype(np.float32)
+        collected = np.vstack((collected, block))
+    collected = collected[:needed, :]
+    return collected[:, 0] if CHANNELS == 1 else np.mean(collected, axis=1)
 
 
 # ━━━━━━━━━━━━━ PHASE 1 · SPATIAL TRANSLATOR ━━━━━━━━━━━━━
@@ -261,35 +307,37 @@ def analyze_body_language(keypoints):
 claude_client = anthropic.Anthropic() if PHASE >= 2 else None
 
 SYSTEM_PROMPT = (
-    "You are NeuroCue, a real-time social cue interpreter and coach designed for "
-    "neurodivergent individuals and employees in workplace settings. Your job is to "
-    "help the user read the room by translating body language signals into plain, "
-    "understandable social meaning.\n\n"
-    "When given a set of body language observations, respond with EXACTLY two parts:\n"
+    "You are NeuroCue, a real-time multi-modal social cue interpreter and coach "
+    "designed for neurodivergent individuals and employees in workplace settings.\n\n"
+    "Every 15 seconds you receive two streams of information about the person the "
+    "user is talking to:\n"
+    "  • [Latest Body Language] — visual pose / gesture observations from a camera.\n"
+    "  • [Transcript] — what they actually said, transcribed from audio.\n\n"
+    "Synthesise BOTH streams into a single, coherent picture. "
+    "Respond with EXACTLY two parts:\n"
     "1. **What's happening:** A single short sentence summarising what the other person "
     "is likely feeling or communicating socially.\n"
     "2. **What to do:** One or two brief, concrete, actionable sentences the user can "
     "act on right now.\n\n"
-    "Keep the total response under 40 words. Be warm, direct, and non-judgemental. "
+    "Keep the total response under 50 words. Be warm, direct, and non-judgemental. "
     "Never use jargon. Assume the user is in a live conversation and needs to glance "
     "at your advice quickly."
 )
 
 
-def get_social_advice(states: list[str]) -> str:
-    """Send all detected body-language states to Claude and return summary + advice."""
-    combined = " ".join(states)
+def get_social_advice(body_states: list[str], transcript: str) -> str:
+    """Send multi-modal context (vision + transcript) to Claude → advice."""
+    body_text = " ".join(body_states) if body_states else "No body language signals detected."
+    user_content = (
+        f"[Latest Body Language]: {body_text}\n"
+        f'[Transcript]: "{transcript}"\n\n'
+        f"What's happening and what should I do?"
+    )
     msg = claude_client.messages.create(
         model="claude-3-haiku-20240307",
-        max_tokens=120,
+        max_tokens=150,
         system=SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": (
-                f"The person I am talking to is showing these signals right now: "
-                f"{combined}\n\nWhat's happening and what should I do?"
-            ),
-        }],
+        messages=[{"role": "user", "content": user_content}],
     )
     return msg.content[0].text
 
@@ -384,7 +432,7 @@ def draw_keypoints(frame, keypoints_norm):
 # ━━━━━━━━━━━━━━━━━━━━━━ MAIN LOOP ━━━━━━━━━━━━━━━━━━━━━━
 
 cap = cv2.VideoCapture(0)
-print(f"NeuroCue v0.2 [PHASE {PHASE} of 3] — Connecting to Red Hat OpenShift Cluster...")
+print(f"NeuroCue v0.3 Multi-Modal [PHASE {PHASE} of 3] — Vision + Transcription")
 
 # ── Shared state between the main (display) thread and the API thread ──
 _lock = threading.Lock()
@@ -393,15 +441,15 @@ _latest_kps: list | None = None          # most recent keypoints from the GPU
 _active_states: list[str] = []
 _state_display_until = 0.0
 _latest_advice = ""
-_last_claude_call = 0.0               # timestamp of last Claude API call
 
 
 def _api_worker():
-    """Background thread: grabs the latest JPEG, sends it to the GPU, updates shared state."""
-    global _latest_kps, _active_states, _state_display_until, _latest_advice, _last_claude_call
+    """Background thread (vision only): grabs the latest JPEG, sends it to the
+    GPU for pose estimation, and updates _active_states.  Does NOT call Claude —
+    the new _audio_and_llm_worker is solely responsible for that."""
+    global _latest_kps, _active_states, _state_display_until
 
     while cap.isOpened():
-        # Grab the most recent frame (skip stale ones automatically)
         with _lock:
             jpg = _latest_jpg
         if jpg is None:
@@ -418,7 +466,6 @@ def _api_worker():
 
             if data['status'] == 'success':
                 kps = data['keypoints'][0]
-                nose_x, nose_y = kps[0]
 
                 with _lock:
                     _latest_kps = kps
@@ -426,38 +473,14 @@ def _api_worker():
                 # ── Phase 1: detect body-language states ──
                 states = analyze_body_language(kps)
 
-                # Live terminal readout every frame
                 if states:
                     print(f"  [State] {' | '.join(states)}")
                 else:
                     print(f"  [State] Neutral — no body language signals detected")
 
-                if states:
-                    with _lock:
-                        _active_states = states
-                        _state_display_until = time.time() + 3.0
-                else:
-                    with _lock:
-                        _active_states = []
-                        _state_display_until = 0.0
-
-                # ── Phase 2: call Claude at most once every CLAUDE_COOLDOWN seconds ──
-                if states and PHASE >= 2:
-                    now = time.time()
-                    if now - _last_claude_call >= CLAUDE_COOLDOWN:
-                        _last_claude_call = now
-                        for s in states:
-                            print(f"  [Body Language → Claude] {s}")
-
-                        try:
-                            advice = get_social_advice(states)
-                            with _lock:
-                                _latest_advice = advice
-                            print(f"  [Claude Response] {advice}")
-                            if PHASE >= 3:
-                                speak_async(advice)
-                        except Exception as llm_err:
-                            print(f"  [LLM Error] {llm_err}")
+                with _lock:
+                    _active_states = states
+                    _state_display_until = time.time() + 3.0 if states else 0.0
             else:
                 print("No person detected.")
                 with _lock:
@@ -466,12 +489,103 @@ def _api_worker():
         except Exception as e:
             print(f"Network lag or server unavailable... {e}")
 
-        # Small sleep to avoid hammering the API faster than it can respond
         time.sleep(0.03)
 
 
-# Start the API worker as a daemon thread
+# ━━━━━━━━━━ AUDIO + LLM HEARTBEAT THREAD ━━━━━━━━━━
+
+def _audio_and_llm_worker():
+    """Daemon thread — the primary heartbeat for the LLM.
+
+    Opens a sounddevice InputStream and collects WINDOW_SECONDS of audio.
+    Every cycle it:
+      a) Exports segment to an in-memory WAV → ElevenLabs STT → transcript
+      b) Reads _active_states from the vision thread
+      c) Calls Claude with both modalities (vision + transcript)
+      d) Pushes advice to _latest_advice and optionally speaks it
+    """
+    global _latest_advice
+
+    blocksize = int(BLOCK_SECONDS * SR)
+
+    print(f"  [Audio] Opening microphone (SR={SR}, block={blocksize}) …")
+    with sd.InputStream(channels=CHANNELS, samplerate=SR,
+                        blocksize=blocksize, callback=_audio_callback):
+        while cap.isOpened():
+            try:
+                # ── 1. Collect WINDOW_SECONDS of audio ──
+                y = _collect_audio_segment(WINDOW_SECONDS)
+
+                # ── 2. Export WAV to memory → ElevenLabs STT ──
+                transcript = ""
+                if PHASE >= 3 and eleven_client is not None:
+                    try:
+                        wav_buf = io.BytesIO()
+                        sf.write(wav_buf, y, SR, format="WAV", subtype="PCM_16")
+                        wav_buf.seek(0)
+                        stt_resp = eleven_client.speech_to_text.convert(
+                            model_id="scribe_v1",
+                            file=wav_buf,
+                            language_code="en",
+                        )
+                        transcript = stt_resp.text if hasattr(stt_resp, "text") else str(stt_resp)
+                    except Exception as stt_err:
+                        print(f"  [STT Error] {stt_err}")
+
+                # ── Pretty-print transcript ──
+                print()
+                print("  ┌─────────────────── TRANSCRIPT ───────────────────┐")
+                if transcript.strip():
+                    words = transcript.strip().split()
+                    line = "  │  "
+                    for w in words:
+                        if len(line) + len(w) + 1 > 55:
+                            print(line)
+                            line = "  │  " + w
+                        else:
+                            line = line + " " + w if line.strip() != "│" else line + w
+                    if line.strip():
+                        print(line)
+                else:
+                    print("  │  (no speech detected)")
+                print("  └─────────────────────────────────────────────────────┘")
+                print()
+
+                # ── 3. Snapshot the latest vision states ──
+                with _lock:
+                    current_body_states = list(_active_states)
+
+                # ── 4. Call Claude (Phase 2+) ──
+                if PHASE >= 2 and claude_client is not None:
+                    for s in current_body_states:
+                        print(f"  [Body Language → Claude] {s}")
+                    print(f'  [Transcript → Claude] "{transcript}"')
+                    try:
+                        advice = get_social_advice(
+                            current_body_states, transcript
+                        )
+                        with _lock:
+                            _latest_advice = advice
+                        print(f"  [Claude Response] {advice}")
+
+                        # ── 5. Speak (Phase 3) ──
+                        if PHASE >= 3:
+                            speak_async(advice)
+                    except Exception as llm_err:
+                        print(f"  [LLM Error] {llm_err}")
+
+            except RuntimeError as mic_err:
+                print(f"  [Audio Error] {mic_err}")
+                time.sleep(1)
+            except Exception as exc:
+                print(f"  [Audio Worker Error] {exc}")
+                time.sleep(1)
+
+
+# Start both daemon threads
 threading.Thread(target=_api_worker, daemon=True).start()
+if PHASE >= 2:
+    threading.Thread(target=_audio_and_llm_worker, daemon=True).start()
 
 while True:
     ret, frame = cap.read()
