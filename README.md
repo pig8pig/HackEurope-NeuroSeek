@@ -1,8 +1,8 @@
-# NeuroSeek
+# NeuroCue
 
 > **Hack Europe 2026** — An enterprise-grade, real-time social co-pilot for neurodivergent individuals.
 
-NeuroSeek uses computer vision to read body language, translates it into psychological intent with an LLM, and whispers real-time social advice into your ear — all in under a second.
+NeuroCue uses computer vision to read body language, translates it into psychological intent with an LLM, and whispers real-time social advice into your ear — all in under a second.
 
 ---
 
@@ -62,8 +62,8 @@ Webcam → GPU Pose Estimation → Body Language Geometry → Claude LLM → Ele
 ### 1. Clone & set up
 
 ```bash
-git clone https://github.com/<your-org>/HackEurope-NeuroSeek.git
-cd HackEurope-NeuroSeek
+git clone https://github.com/<your-org>/NeuroCue.git
+cd NeuroCue
 python -m venv .venv
 .venv\Scripts\activate        # Windows
 pip install -r requirements.txt

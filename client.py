@@ -1,12 +1,20 @@
+import io
+import os
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
+import pygame
 import cv2
 import requests
 import math
 import threading
 import time
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import anthropic
 from elevenlabs.client import ElevenLabs
-from elevenlabs import play
+
+pygame.mixer.init()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━ CONFIG ━━━━━━━━━━━━━━━━━━━━━━
@@ -15,7 +23,7 @@ from elevenlabs import play
 #   1 = Phase 1 only (vision + body-language overlay, no API keys needed)
 #   2 = Phase 1 + 2 (adds Claude LLM advice, needs ANTHROPIC_API_KEY)
 #   3 = All phases  (adds ElevenLabs TTS audio, needs ELEVEN_API_KEY too)
-PHASE = 2
+PHASE = 3
 
 # Your live Cloudflare URL pointing to the A10G
 API_URL = "https://wars-emerald-ratio-jvc.trycloudflare.com/analyze-pose"
@@ -32,8 +40,8 @@ SHOULDER_ASYM_DEGREES  = 18.0    # min shoulder angle for "uneven shoulders"
 LEAN_FORWARD_RATIO     = 0.85    # shoulder-hip vertical ratio — below = leaning forward
 LEAN_LATERAL_RATIO     = 0.15    # shoulder-hip lateral offset ratio — above = leaning sideways
 
-# Cooldown so we don't spam the LLM for the same gesture (seconds)
-STATE_COOLDOWN = 10.0
+# Minimum gap between Claude API calls (seconds)
+CLAUDE_COOLDOWN = 15.0
 
 
 # ━━━━━━━━━━━━━ PHASE 1 · SPATIAL TRANSLATOR ━━━━━━━━━━━━━
@@ -253,23 +261,33 @@ def analyze_body_language(keypoints):
 claude_client = anthropic.Anthropic() if PHASE >= 2 else None
 
 SYSTEM_PROMPT = (
-    "You are a real-time social coach for a neurodivergent user who is in a live "
-    "conversation. Respond with exactly one short, actionable sentence. "
-    "Be warm and concise."
+    "You are NeuroCue, a real-time social cue interpreter and coach designed for "
+    "neurodivergent individuals and employees in workplace settings. Your job is to "
+    "help the user read the room by translating body language signals into plain, "
+    "understandable social meaning.\n\n"
+    "When given a set of body language observations, respond with EXACTLY two parts:\n"
+    "1. **What's happening:** A single short sentence summarising what the other person "
+    "is likely feeling or communicating socially.\n"
+    "2. **What to do:** One or two brief, concrete, actionable sentences the user can "
+    "act on right now.\n\n"
+    "Keep the total response under 40 words. Be warm, direct, and non-judgemental. "
+    "Never use jargon. Assume the user is in a live conversation and needs to glance "
+    "at your advice quickly."
 )
 
 
-def get_social_advice(state: str) -> str:
-    """Send the detected body-language state to Claude and return 1-sentence advice."""
+def get_social_advice(states: list[str]) -> str:
+    """Send all detected body-language states to Claude and return summary + advice."""
+    combined = " ".join(states)
     msg = claude_client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=100,
+        model="claude-3-haiku-20240307",
+        max_tokens=120,
         system=SYSTEM_PROMPT,
         messages=[{
             "role": "user",
             "content": (
-                f"The person I am talking to just exhibited the following body language: "
-                f"{state} What should I do?"
+                f"The person I am talking to is showing these signals right now: "
+                f"{combined}\n\nWhat's happening and what should I do?"
             ),
         }],
     )
@@ -278,18 +296,31 @@ def get_social_advice(state: str) -> str:
 
 # ━━━━━━━━━━━━━ PHASE 3 · AUDIO OUTPUT ━━━━━━━━━━━━━
 
-eleven_client = ElevenLabs() if PHASE >= 3 else None
+eleven_client = ElevenLabs(api_key=os.getenv("ELEVEN_API_KEY")) if PHASE >= 3 else None
 
 
 def _speak(text: str):
-    """Generate TTS via ElevenLabs and play it (blocking)."""
+    """Generate TTS via ElevenLabs and play it using Pygame."""
     try:
-        audio = eleven_client.text_to_speech.convert(
+        # 1. Generate the raw audio byte stream
+        audio_generator = eleven_client.text_to_speech.convert(
             text=text,
-            voice_id="JBFqnCBsd6RMkjVDRZzb",       # "George" — calm & clear
+            voice_id="JBFqnCBsd6RMkjVDRZzb",
             model_id="eleven_turbo_v2_5",
         )
-        play(audio)                                  # requires mpv or ffplay on PATH
+        
+        # 2. Collect bytes into memory
+        audio_bytes = b"".join(list(audio_generator))
+        
+        # 3. Stream directly to speakers
+        audio_stream = io.BytesIO(audio_bytes)
+        pygame.mixer.music.load(audio_stream)
+        pygame.mixer.music.play()
+        
+        # 4. Keep thread alive until audio finishes
+        while pygame.mixer.music.get_busy():
+            pygame.time.Clock().tick(10)
+
     except Exception as e:
         print(f"  [Audio Error] {e}")
 
@@ -353,7 +384,7 @@ def draw_keypoints(frame, keypoints_norm):
 # ━━━━━━━━━━━━━━━━━━━━━━ MAIN LOOP ━━━━━━━━━━━━━━━━━━━━━━
 
 cap = cv2.VideoCapture(0)
-print(f"NeuroSeek v0.2 [PHASE {PHASE} of 3] — Connecting to Red Hat OpenShift Cluster...")
+print(f"NeuroCue v0.2 [PHASE {PHASE} of 3] — Connecting to Red Hat OpenShift Cluster...")
 
 # ── Shared state between the main (display) thread and the API thread ──
 _lock = threading.Lock()
@@ -362,12 +393,12 @@ _latest_kps: list | None = None          # most recent keypoints from the GPU
 _active_states: list[str] = []
 _state_display_until = 0.0
 _latest_advice = ""
-_last_triggered: dict[str, float] = {}
+_last_claude_call = 0.0               # timestamp of last Claude API call
 
 
 def _api_worker():
     """Background thread: grabs the latest JPEG, sends it to the GPU, updates shared state."""
-    global _latest_kps, _active_states, _state_display_until, _latest_advice
+    global _latest_kps, _active_states, _state_display_until, _latest_advice, _last_claude_call
 
     while cap.isOpened():
         # Grab the most recent frame (skip stale ones automatically)
@@ -410,22 +441,23 @@ def _api_worker():
                         _active_states = []
                         _state_display_until = 0.0
 
-                for state in states:
+                # ── Phase 2: call Claude at most once every CLAUDE_COOLDOWN seconds ──
+                if states and PHASE >= 2:
                     now = time.time()
-                    if now - _last_triggered.get(state, 0) > STATE_COOLDOWN:
-                        _last_triggered[state] = now
-                        print(f"  [Body Language] {state}")
+                    if now - _last_claude_call >= CLAUDE_COOLDOWN:
+                        _last_claude_call = now
+                        for s in states:
+                            print(f"  [Body Language → Claude] {s}")
 
-                        if PHASE >= 2:
-                            try:
-                                advice = get_social_advice(state)
-                                with _lock:
-                                    _latest_advice = advice
-                                print(f"  [Coach] {advice}")
-                                if PHASE >= 3:
-                                    speak_async(advice)
-                            except Exception as llm_err:
-                                print(f"  [LLM Error] {llm_err}")
+                        try:
+                            advice = get_social_advice(states)
+                            with _lock:
+                                _latest_advice = advice
+                            print(f"  [Claude Response] {advice}")
+                            if PHASE >= 3:
+                                speak_async(advice)
+                        except Exception as llm_err:
+                            print(f"  [LLM Error] {llm_err}")
             else:
                 print("No person detected.")
                 with _lock:
@@ -469,12 +501,27 @@ while True:
             cv2.putText(frame, f">> {st}", (10, y_pos),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-    # OSD: overlay the latest coach advice
+    # OSD: overlay the latest coach advice (word-wrapped, bottom of screen)
     if advice and PHASE >= 2:
-        cv2.putText(frame, advice[:90], (10, frame.shape[0] - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+        max_chars = 70  # chars per line at this font size
+        words = advice.split()
+        lines = []
+        current = ""
+        for w in words:
+            if current and len(current) + 1 + len(w) > max_chars:
+                lines.append(current)
+                current = w
+            else:
+                current = f"{current} {w}".strip() if current else w
+        if current:
+            lines.append(current)
+        # Draw lines bottom-up so the last line sits near the frame bottom
+        for i, line in enumerate(reversed(lines)):
+            y_pos = frame.shape[0] - 20 - i * 28
+            cv2.putText(frame, line, (10, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
-    cv2.imshow('NeuroSeek Client Feed', frame)
+    cv2.imshow('NeuroCue Client Feed', frame)
 
     # Press 'q' to quit
     if cv2.waitKey(1) & 0xFF == ord('q'):
